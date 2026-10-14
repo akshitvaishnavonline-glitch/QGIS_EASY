@@ -1,0 +1,244 @@
+"""QGIS_EASY: Bulk Coordinate Transformer from Spreadsheet Table
+
+Install this file in the QGIS Processing Scripts folder.
+The input must be a non-spatial table layer already loaded in QGIS (for example,
+CSV/XLSX). Select X and Y fields, set the source and target CRS, and choose an
+Excel (.xlsx) output. The algorithm creates a reprojected point layer and an
+Excel table containing the selected attributes plus XCOORD and YCOORD in the
+target CRS.
+"""
+
+from qgis.PyQt.QtCore import QVariant
+from qgis.core import (
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingParameterVectorLayer,
+    QgsProcessingParameterField,
+    QgsProcessingParameterCrs,
+    QgsProcessingParameterFileDestination,
+    QgsProcessingParameterFeatureSink,
+    QgsFields,
+    QgsField,
+    QgsFeature,
+    QgsGeometry,
+    QgsPointXY,
+    QgsCoordinateTransform,
+    QgsProject,
+    QgsVectorLayer,
+    QgsVectorFileWriter,
+    QgsWkbTypes,
+    QgsFeatureSink,
+)
+
+
+class QgisEasyBulkCoordinateTransformer(QgsProcessingAlgorithm):
+    INPUT_TABLE = 'INPUT_TABLE'
+    X_FIELD = 'X_FIELD'
+    Y_FIELD = 'Y_FIELD'
+    SOURCE_CRS = 'SOURCE_CRS'
+    TARGET_CRS = 'TARGET_CRS'
+    FIELDS = 'FIELDS'
+    OUTPUT_POINTS = 'OUTPUT_POINTS'
+    OUTPUT_XLSX = 'OUTPUT_XLSX'
+
+    def name(self):
+        return 'qgis_easy_bulk_coordinate_transformer'
+
+    def displayName(self):
+        return 'QGIS_EASY — Bulk Coordinate Transformer (Spreadsheet to Excel)'
+
+    def group(self):
+        return 'QGIS_EASY'
+
+    def groupId(self):
+        return 'qgis_easy'
+
+    def shortHelpString(self):
+        return (
+            'Transforms coordinate rows from a spreadsheet table in bulk. '
+            'Choose X and Y fields, source CRS, target CRS, and fields to retain. '
+            'The tool creates a reprojected point layer and an XLSX table with '
+            'the retained fields plus XCOORD and YCOORD in the target CRS. '
+            'Load the CSV/XLSX table into QGIS first. For longitude/latitude, '
+            'X is longitude and Y is latitude; the source CRS is commonly EPSG:4326. '
+            'Excel files cannot store GIS point geometry, so use the point-layer '
+            'output if you also need a spatial layer.'
+        )
+
+    def initAlgorithm(self, config=None):
+        self.addParameter(QgsProcessingParameterVectorLayer(
+            self.INPUT_TABLE,
+            'Input spreadsheet table (load CSV/XLSX into QGIS first)',
+            types=[QgsProcessing.TypeVector],
+        ))
+        self.addParameter(QgsProcessingParameterField(
+            self.X_FIELD, 'X coordinate field (longitude or easting)',
+            parentLayerParameterName=self.INPUT_TABLE,
+            type=QgsProcessingParameterField.Any,
+        ))
+        self.addParameter(QgsProcessingParameterField(
+            self.Y_FIELD, 'Y coordinate field (latitude or northing)',
+            parentLayerParameterName=self.INPUT_TABLE,
+            type=QgsProcessingParameterField.Any,
+        ))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.SOURCE_CRS, 'Source CRS', defaultValue='EPSG:4326'
+        ))
+        self.addParameter(QgsProcessingParameterCrs(
+            self.TARGET_CRS, 'Target CRS (choose required UTM zone)',
+            defaultValue='EPSG:32644'
+        ))
+        self.addParameter(QgsProcessingParameterField(
+            self.FIELDS,
+            'Fields to keep in output (leave empty to keep all fields)',
+            parentLayerParameterName=self.INPUT_TABLE,
+            type=QgsProcessingParameterField.Any,
+            allowMultiple=True,
+            optional=True,
+        ))
+        self.addParameter(QgsProcessingParameterFeatureSink(
+            self.OUTPUT_POINTS,
+            'Reprojected point layer (save as GeoPackage or temporary layer)',
+            type=QgsProcessing.TypeVectorPoint,
+        ))
+        self.addParameter(QgsProcessingParameterFileDestination(
+            self.OUTPUT_XLSX,
+            'Excel output table (.xlsx)',
+            fileFilter='Excel workbook (*.xlsx)',
+        ))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        table = self.parameterAsVectorLayer(parameters, self.INPUT_TABLE, context)
+        if table is None or not table.isValid():
+            raise Exception('Input table could not be loaded. Add the CSV/XLSX to QGIS first.')
+
+        x_name = self.parameterAsString(parameters, self.X_FIELD, context)
+        y_name = self.parameterAsString(parameters, self.Y_FIELD, context)
+        source_crs = self.parameterAsCrs(parameters, self.SOURCE_CRS, context)
+        target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
+        keep_names = self.parameterAsFields(parameters, self.FIELDS, context)
+        if not keep_names:
+            keep_names = table.fields().names()
+
+        x_idx = table.fields().indexFromName(x_name)
+        y_idx = table.fields().indexFromName(y_name)
+        if x_idx < 0 or y_idx < 0:
+            raise Exception('Could not find the selected X or Y field.')
+        if x_idx == y_idx:
+            raise Exception('Select different fields for X and Y coordinates.')
+        if not source_crs.isValid() or not target_crs.isValid():
+            raise Exception('Please choose valid source and target coordinate reference systems.')
+
+        # Build a predictable field order, equivalent to Refactor Fields:
+        # selected source attributes first, then target-CRS X and Y coordinates.
+        out_fields = QgsFields()
+        source_indexes = []
+        for name in keep_names:
+            idx = table.fields().indexFromName(name)
+            if idx >= 0:
+                out_fields.append(table.fields().at(idx))
+                source_indexes.append(idx)
+
+        x_out_name = self._unique_field_name(out_fields, 'XCOORD')
+        out_fields.append(QgsField(x_out_name, QVariant.Double, 'double', 20, 8))
+        y_out_name = self._unique_field_name(out_fields, 'YCOORD')
+        out_fields.append(QgsField(y_out_name, QVariant.Double, 'double', 20, 8))
+
+        sink, dest_id = self.parameterAsSink(
+            parameters, self.OUTPUT_POINTS, context,
+            out_fields, QgsWkbTypes.Point, target_crs
+        )
+        if sink is None:
+            raise Exception('Could not create the point-layer output. Choose a valid destination.')
+
+        xform = QgsCoordinateTransform(source_crs, target_crs, context.transformContext())
+        excel_rows = []
+        processed = 0
+        skipped = 0
+        total = table.featureCount()
+
+        for i, input_feature in enumerate(table.getFeatures()):
+            if feedback.isCanceled():
+                break
+            try:
+                x_val = float(input_feature.attribute(x_idx))
+                y_val = float(input_feature.attribute(y_idx))
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            if not (-float('inf') < x_val < float('inf')) or not (-float('inf') < y_val < float('inf')):
+                skipped += 1
+                continue
+
+            point = QgsPointXY(x_val, y_val)
+            try:
+                point = xform.transform(point)
+            except Exception:
+                skipped += 1
+                continue
+
+            output_feature = QgsFeature(out_fields)
+            attrs = [input_feature.attribute(idx) for idx in source_indexes]
+            attrs.extend([point.x(), point.y()])
+            output_feature.setAttributes(attrs)
+            output_feature.setGeometry(QgsGeometry.fromPointXY(point))
+            sink.addFeature(output_feature, QgsFeatureSink.FastInsert)
+            excel_rows.append(attrs)
+            processed += 1
+
+            if total:
+                feedback.setProgress(int((i + 1) * 100 / total))
+
+        # Create a non-spatial table for Excel because XLSX does not preserve
+        # GIS point geometry. Attribute order matches the refactored point layer.
+        excel_layer = QgsVectorLayer('None', 'QGIS_EASY_coordinate_output', 'memory')
+        provider = excel_layer.dataProvider()
+        provider.addAttributes([out_fields.at(i) for i in range(out_fields.count())])
+        excel_layer.updateFields()
+        excel_features = []
+        for attrs in excel_rows:
+            feat = QgsFeature(excel_layer.fields())
+            feat.setAttributes(attrs)
+            excel_features.append(feat)
+        provider.addFeatures(excel_features)
+        excel_layer.updateFields()
+
+        output_path = self.parameterAsFileOutput(parameters, self.OUTPUT_XLSX, context)
+        if not output_path:
+            raise Exception('Choose a destination for the Excel output.')
+        if not output_path.lower().endswith('.xlsx'):
+            output_path += '.xlsx'
+
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = 'XLSX'
+        options.fileEncoding = 'UTF-8'
+        options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
+            excel_layer, output_path, context.transformContext(), options
+        )
+        if result[0] != QgsVectorFileWriter.NoError:
+            raise Exception('Excel export failed: ' + str(result[1]))
+
+        feedback.pushInfo('Rows transformed: {}'.format(processed))
+        feedback.pushInfo('Rows skipped (missing/invalid coordinates or transform errors): {}'.format(skipped))
+        feedback.pushInfo('Target CRS: {}'.format(target_crs.authid() or target_crs.description()))
+        feedback.pushInfo('Excel file: {}'.format(output_path))
+        feedback.pushInfo('Point layer created in target CRS.')
+
+        return {
+            self.OUTPUT_POINTS: dest_id,
+            self.OUTPUT_XLSX: output_path,
+        }
+
+    @staticmethod
+    def _unique_field_name(fields, base_name):
+        names = {field.name().lower() for field in fields}
+        candidate = base_name
+        suffix = 2
+        while candidate.lower() in names:
+            candidate = '{}_{}'.format(base_name, suffix)
+            suffix += 1
+        return candidate
+
+    def createInstance(self):
+        return QgisEasyBulkCoordinateTransformer()
